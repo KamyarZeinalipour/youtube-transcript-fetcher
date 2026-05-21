@@ -160,7 +160,7 @@ async function fetchViaWebPage(videoId) {
     `https://www.youtube.com/watch?v=${videoId}`,
     {
       headers: {
-        "User-Agent": WEB_USER_AGENT,
+        "User-Agent": INNERTUBE_CLIENTS[2].userAgent,
         "Accept-Language": "en-US,en;q=0.9",
         Cookie: "CONSENT=PENDING+999",
       },
