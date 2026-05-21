@@ -1,14 +1,11 @@
-import { YoutubeTranscript } from "youtube-transcript";
+import { fetchTranscript } from "./youtube-transcript.js";
 
 /**
  * Next.js API Route — fetches YouTube transcript SERVER-SIDE
- * using the youtube-transcript library (JS version of Python's youtube-transcript-api).
+ * using a custom implementation with consent-cookie bypass.
  *
- * ★ WHY THIS SOLVES THE BAN PROBLEM ★
- *   - This code runs on whatever server hosts your Next.js app
- *   - When deployed to Vercel (free), requests come from VERCEL's IPs
- *   - Your own banned server IP is never used
- *   - No API key needed!
+ * This works on Vercel/cloud platforms where npm libraries fail
+ * because YouTube blocks data-center IPs with consent pages.
  */
 export async function GET(request) {
   const { searchParams } = new URL(request.url);
@@ -22,35 +19,8 @@ export async function GET(request) {
   }
 
   try {
-    const transcript = await YoutubeTranscript.fetchTranscript(videoId);
-
-    // Combine all transcript lines into one full text
-    const fullText = transcript.map((line) => line.text).join(" ");
-
-    // Try to get video title from YouTube oEmbed (lightweight, no API key)
-    let title = "";
-    let channelTitle = "";
-    try {
-      const oembedRes = await fetch(
-        `https://www.youtube.com/oembed?url=https://www.youtube.com/watch?v=${videoId}&format=json`
-      );
-      if (oembedRes.ok) {
-        const oembed = await oembedRes.json();
-        title = oembed.title || "";
-        channelTitle = oembed.author_name || "";
-      }
-    } catch {
-      // oEmbed is optional, ignore errors
-    }
-
-    return Response.json({
-      videoId,
-      title,
-      channelTitle,
-      lines: transcript,
-      fullText,
-      lineCount: transcript.length,
-    });
+    const data = await fetchTranscript(videoId);
+    return Response.json(data);
   } catch (err) {
     return Response.json(
       {
