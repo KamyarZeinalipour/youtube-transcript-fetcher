@@ -12,20 +12,28 @@
 const INNERTUBE_API_URL =
   "https://www.youtube.com/youtubei/v1/player?prettyPrint=false";
 
-const INNERTUBE_CLIENT_VERSION = "20.10.38";
-
-const INNERTUBE_CONTEXT = {
-  client: {
-    clientName: "ANDROID",
-    clientVersion: INNERTUBE_CLIENT_VERSION,
+// Multiple InnerTube clients to try — different clients may work
+// from different IPs, so we try them all
+const INNERTUBE_CLIENTS = [
+  {
+    name: "IOS",
+    context: { client: { clientName: "IOS", clientVersion: "20.10.4" } },
+    userAgent:
+      "com.google.ios.youtube/20.10.4 (iPhone16,2; U; CPU iOS 18_2_1 like Mac OS X)",
   },
-};
-
-const INNERTUBE_USER_AGENT = `com.google.android.youtube/${INNERTUBE_CLIENT_VERSION} (Linux; U; Android 14)`;
-
-const WEB_USER_AGENT =
-  "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_4) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/85.0.4183.83 Safari/537.36";
-
+  {
+    name: "ANDROID",
+    context: { client: { clientName: "ANDROID", clientVersion: "20.10.38" } },
+    userAgent:
+      "com.google.android.youtube/20.10.38 (Linux; U; Android 14)",
+  },
+  {
+    name: "WEB",
+    context: { client: { clientName: "WEB", clientVersion: "2.20250101.00.00" } },
+    userAgent:
+      "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_4) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/85.0.4183.83 Safari/537.36",
+  },
+];
 /**
  * Decode common HTML entities in transcript text
  */
@@ -94,35 +102,54 @@ function parseTranscriptXml(xml, lang) {
 }
 
 /**
- * Fetch transcript using InnerTube API (primary method)
+ * Fetch transcript using InnerTube API — tries multiple clients
  */
 async function fetchViaInnerTube(videoId) {
-  const resp = await fetch(INNERTUBE_API_URL, {
-    method: "POST",
-    headers: {
-      "Content-Type": "application/json",
-      "User-Agent": INNERTUBE_USER_AGENT,
-    },
-    body: JSON.stringify({
-      context: INNERTUBE_CONTEXT,
-      videoId,
-    }),
-  });
+  for (const client of INNERTUBE_CLIENTS) {
+    try {
+      const resp = await fetch(INNERTUBE_API_URL, {
+        method: "POST",
+        headers: {
+          "Content-Type": "application/json",
+          "User-Agent": client.userAgent,
+        },
+        body: JSON.stringify({
+          context: client.context,
+          videoId,
+        }),
+      });
 
-  if (!resp.ok) return null;
+      if (!resp.ok) continue;
 
-  const data = await resp.json();
-  const captionTracks =
-    data?.captions?.playerCaptionsTracklistRenderer?.captionTracks;
+      const data = await resp.json();
+      const captionTracks =
+        data?.captions?.playerCaptionsTracklistRenderer?.captionTracks;
 
-  if (!Array.isArray(captionTracks) || captionTracks.length === 0) {
-    return null;
+      if (!Array.isArray(captionTracks) || captionTracks.length === 0) continue;
+
+      // Pick the best track (prefer English)
+      const track =
+        captionTracks.find((t) => t.languageCode === "en") ||
+        captionTracks.find((t) => t.languageCode?.startsWith("en")) ||
+        captionTracks[0];
+
+      // Verify the XML URL actually returns content
+      const xmlResp = await fetch(track.baseUrl, {
+        headers: { "User-Agent": client.userAgent },
+      });
+      if (!xmlResp.ok) continue;
+
+      const xml = await xmlResp.text();
+      if (!xml || xml.length < 10) continue; // Empty XML, try next client
+
+      const videoDetails = data?.videoDetails || {};
+      return { track, xml, videoDetails, client: client.name };
+    } catch {
+      continue;
+    }
   }
 
-  // Also grab video details
-  const videoDetails = data?.videoDetails || {};
-
-  return { captionTracks, videoDetails };
+  return null;
 }
 
 /**
@@ -182,36 +209,47 @@ async function fetchViaWebPage(videoId) {
  * Main export: fetch transcript for a video
  */
 export async function fetchTranscript(videoId) {
-  // Try InnerTube API first (works on cloud/data-center IPs)
-  let result = await fetchViaInnerTube(videoId);
+  // Try InnerTube API first (tries IOS, ANDROID, WEB clients)
+  const innerTubeResult = await fetchViaInnerTube(videoId);
 
-  // Fall back to web scraping
-  if (!result) {
-    result = await fetchViaWebPage(videoId);
+  if (innerTubeResult) {
+    const { track, xml, videoDetails } = innerTubeResult;
+    const lang = track.languageCode || "en";
+    const lines = parseTranscriptXml(xml, lang);
+
+    if (lines.length > 0) {
+      return {
+        lines,
+        fullText: lines.map((l) => l.text).join(" "),
+        lineCount: lines.length,
+        language: track.name?.simpleText || track.languageCode,
+        title: videoDetails.title || "",
+        channelTitle: videoDetails.author || "",
+      };
+    }
   }
 
-  if (!result) {
+  // Fall back to web scraping
+  const webResult = await fetchViaWebPage(videoId);
+
+  if (!webResult) {
     throw new Error(
       "Could not find captions for this video. It may not have subtitles, or the video is unavailable."
     );
   }
 
-  const { captionTracks, videoDetails } = result;
+  const { captionTracks, videoDetails } = webResult;
 
-  // Pick the best track (prefer English)
   const track =
     captionTracks.find((t) => t.languageCode === "en") ||
     captionTracks.find((t) => t.languageCode?.startsWith("en")) ||
     captionTracks[0];
 
-  // Fetch the caption XML/data
-  const captionUrl = new URL(track.baseUrl);
-  if (!captionUrl.hostname.endsWith(".youtube.com")) {
-    throw new Error("Invalid caption URL");
-  }
-
   const xmlResp = await fetch(track.baseUrl, {
-    headers: { "User-Agent": WEB_USER_AGENT },
+    headers: {
+      "User-Agent": INNERTUBE_CLIENTS[0].userAgent,
+      Cookie: "CONSENT=PENDING+999",
+    },
   });
 
   if (!xmlResp.ok) {
@@ -237,3 +275,4 @@ export async function fetchTranscript(videoId) {
     channelTitle: videoDetails.author || "",
   };
 }
+
